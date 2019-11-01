@@ -70,9 +70,20 @@ template useVar(result: var NimNode, futureVarNode: NimNode, valueReceiver,
   ##    rootReceiver: ??? TODO
   # -> yield future<x>
   result.add newNimNode(nnkYieldStmt, fromNode).add(futureVarNode)
-  # -> future<x>.read
-  valueReceiver = newDotExpr(futureVarNode, newIdentNode("read"))
+  # -> try:
+  # ->  future<x>.read
+  # -> finally:
+  # ->  dispose(future<x>)
+  #var tmpReceiver = genSym(nskVar, "futureReceiver")
+  #valueReceiver = newDotExpr(futureVarNode, newIdentNode("read"))
+  valueReceiver = newTree(nnkTryStmt,
+    newDotExpr(futureVarNode, newIdentNode("read")),
+    newTree(nnkFinally, newDotExpr(futureVarNode, newIdentNode("dispose")))
+  )
   result.add rootReceiver
+  # dispose of the Future
+  # result.add newDotExpr(futureVarNode, newIdentNode("dispose"))
+  
 
 template createVar(result: var NimNode, futSymName: string,
                    asyncProc: NimNode,
