@@ -15,8 +15,7 @@
 const
   InitialThreshold = 4*1024*1024 # X MB because marking&sweeping is slow
   withBitvectors = defined(gcUseBitvectors)
-  # bitvectors are significantly faster for GC-bench, but slower for
-  # bootstrapping and use more memory
+  # bitvectors are significantly faster for GC-bench, but slower for  # bootstrapping and use more memory
   rcWhite = 0
   rcGrey = 1   # unused
   rcBlack = 2
@@ -28,6 +27,9 @@ when defined(memProfiler):
 
 when hasThreadSupport:
   import sharedlist
+
+when defined(nimTracing) or defined(leakDetector) or defined(nimGcRefLeak):
+  import io
 
 type
   WalkOp = enum
@@ -191,12 +193,12 @@ proc nimGCunref(p: pointer) {.compilerproc.} =
 when defined(nimGcRefLeak):
   proc writeLeaks() =
     for i in 0..gch.additionalRoots.len-1:
-      c_fprintf(stdout, "[Heap] NEW STACK TRACE\n")
+      c_fprintf(cast[CFilePtr](stdout), "[Heap] NEW STACK TRACE\n")
       for ii in 0..MaxTraceLen-1:
         let line = ax[i].lines[ii]
         let file = ax[i].files[ii]
         if isNil(line): break
-        c_fprintf(stdout, "[Heap] %s(%s)\n", file, line)
+        c_fprintf(cast[CFilePtr](stdout), "[Heap] %s(%s)\n", file, line)
 
 include gc_common
 
@@ -247,6 +249,8 @@ proc forAllChildren(cell: PCell, op: WalkOp) =
   gcAssert(isAllocatedPtr(gch.region, cell), "gah, not allocated anymore! C")
   gcAssert(cell.typ != nil, "forAllChildren: 2")
   gcAssert cell.typ.kind in {tyRef, tySequence, tyString}, "forAllChildren: 3"
+  when leakDetector:
+    c_fprintf(cast[CFilePtr](stdout), "  cell: %s (%s)\n", cell.typ.name, $cell.typ.kind)
   let marker = cell.typ.marker
   if marker != nil:
     marker(cellToUsr(cell), op.int)
@@ -275,8 +279,9 @@ proc rawNewObj(typ: PNimType, size: int, gch: var GcHeap): pointer =
   res.typ = typ
   when leakDetector and not hasThreadSupport:
     if framePtr != nil and framePtr.prev != nil:
-      res.filename = framePtr.prev.filename
-      res.line = framePtr.prev.line
+      res.filename = framePtr.prev.prev.filename
+      res.line = framePtr.prev.prev.line
+      c_fprintf(cast[CFilePtr](stdout), "%s allocated from : %s:%i\n", res.typ.name, res.filename, res.line)
   res.refcount = 0
   when withBitvectors: incl(gch.allocated, res)
   when useCellIds:
@@ -368,8 +373,8 @@ proc mark(gch: var GcHeap, c: PCell) =
     # XXX no 'if c.refCount != rcBlack' here?
     when defined(nimTracing):
       if gch.tracing:
-        for i in 1..gch.indentation: c_fprintf(stdout, " ")
-        c_fprintf(stdout, "start marking %p of type %s ((\n",
+        for i in 1..gch.indentation: c_fprintf(cast[CFilePtr](stdout), " ")
+        c_fprintf(cast[CFilePtr](stdout), "start marking %p of type %s ((\n",
                   c, c.typ.name)
         inc gch.indentation, 2
 
@@ -386,8 +391,8 @@ proc mark(gch: var GcHeap, c: PCell) =
     when defined(nimTracing):
       if gch.tracing:
         dec gch.indentation, 2
-        for i in 1..gch.indentation: c_fprintf(stdout, " ")
-        c_fprintf(stdout, "finished marking %p of type %s))\n",
+        for i in 1..gch.indentation: c_fprintf(cast[CFilePtr](stdout), " ")
+        c_fprintf(cast[CFilePtr](stdout), "finished marking %p of type %s))\n",
                   c, c.typ.name)
 
 proc doOperation(p: pointer, op: WalkOp) =
@@ -411,6 +416,7 @@ proc freeCyclicCell(gch: var GcHeap, c: PCell) =
   gcAssert(isAllocatedPtr(gch.region, c), "freeCyclicCell() on an invalid cell!")
   inc gch.stat.freedObjects
   prepareDealloc(c)
+  #c_fprintf(cast[CFilePtr](stdout), "freeing: %s from %s:%i\n", c.typ.name, c.filename, c.line)
   when reallyDealloc: rawDealloc(gch.region, c)
   else:
     gcAssert(c.typ != nil, "freeCyclicCell")
@@ -467,7 +473,10 @@ proc deepDispose*[T](x: var ref T) {.inline.} =
   ## and avoid the pauses introduced by the tracing GC.
   let p = cast[pointer](x)
   if p != nil:
-    deepDisposeImpl(gch, usrToCell(p))
+    let c = usrToCell(p)
+    when leakDetector:
+      c_fprintf(cast[CFilePtr](stdout), "deepDispose: %s\n", c.typ.name)
+    deepDisposeImpl(gch, c)
     x = nil
 
 proc deepDispose*[T: proc](x: var T) {.inline.} =
@@ -477,7 +486,10 @@ proc deepDispose*[T: proc](x: var T) {.inline.} =
   when (T is "closure") or (T is iterator):
     let p = cast[pointer](rawEnv(x))
     if p != nil:
-      deepDisposeImpl(gch, usrToCell(p))
+      let c = usrToCell(p)
+      when leakDetector:
+        c_fprintf(cast[CFilePtr](stdout), "deepDispose (proc): %s\n", c.typ.name)
+      deepDisposeImpl(gch, c)
       # 'rawEnv(x) = nil' does not compile, hence the '.emit':
       {.emit: """
       `x`->ClE_0 = NIM_NIL;
@@ -509,15 +521,15 @@ proc markGlobals(gch: var GcHeap) =
   if gch.gcThreadId == 0:
     when defined(nimTracing):
       if gch.tracing:
-        c_fprintf(stdout, "------- globals marking phase:\n")
+        c_fprintf(cast[CFilePtr](stdout), "------- globals marking phase:\n")
     for i in 0 .. globalMarkersLen-1: globalMarkers[i]()
   when defined(nimTracing):
     if gch.tracing:
-      c_fprintf(stdout, "------- thread locals marking phase:\n")
+      c_fprintf(cast[CFilePtr](stdout), "------- thread locals marking phase:\n")
   for i in 0 .. threadLocalMarkersLen-1: threadLocalMarkers[i]()
   when defined(nimTracing):
     if gch.tracing:
-      c_fprintf(stdout, "------- additional roots marking phase:\n")
+      c_fprintf(cast[CFilePtr](stdout), "------- additional roots marking phase:\n")
   let d = gch.additionalRoots.d
   for i in 0 .. gch.additionalRoots.len-1: mark(gch, d[i])
 
@@ -539,7 +551,7 @@ proc collectCTBody(gch: var GcHeap) =
     gch.stat.maxStackSize = max(gch.stat.maxStackSize, stackSize())
   when defined(nimTracing):
     if gch.tracing:
-      c_fprintf(stdout, "------- stack marking phase:\n")
+      c_fprintf(cast[CFilePtr](stdout), "------- stack marking phase:\n")
   prepareForInteriorPointerChecking(gch.region)
   markStackAndRegisters(gch)
   markGlobals(gch)
