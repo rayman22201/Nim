@@ -22,12 +22,11 @@ proc skipStmtList(node: NimNode): NimNode {.compileTime.} =
   if node[0].kind == nnkStmtList:
     result = node[0]
 
-template createCb(retFutureSym, iteratorNameSym,
+template createCb(retFutureSym, nameIterVar,
                   strName, identName, futureVarCompletions: untyped) =
   bind finished
   let retFutUnown = unown retFutureSym
 
-  var nameIterVar = iteratorNameSym
   proc identName {.closure.} =
     try:
       if not nameIterVar.finished:
@@ -74,7 +73,6 @@ template useVar(result: var NimNode, futureVarNode: NimNode, valueReceiver,
   # ->  future<x>.read
   # -> finally:
   # ->  dispose(future<x>)
-  #var tmpReceiver = genSym(nskVar, "futureReceiver")
   #valueReceiver = newDotExpr(futureVarNode, newIdentNode("read"))
   valueReceiver = newTree(nnkTryStmt,
     newDotExpr(futureVarNode, newIdentNode("read")),
@@ -113,6 +111,7 @@ proc createFutureVarCompletions(futureVarIdents: seq[NimNode],
     )
 
 proc processBody(node, retFutureSym: NimNode,
+                 retFutureType: NimNode,
                  subTypeIsVoid: bool,
                  futureVarIdents: seq[NimNode]): NimNode {.compileTime.} =
   #echo(node.treeRepr)
@@ -131,7 +130,7 @@ proc processBody(node, retFutureSym: NimNode,
       else:
         result.add newCall(newIdentNode("complete"), retFutureSym)
     else:
-      let x = node[0].processBody(retFutureSym, subTypeIsVoid,
+      let x = node[0].processBody(retFutureSym, retFutureType, subTypeIsVoid,
                                   futureVarIdents)
       if x.kind == nnkYieldStmt: result.add x
       else:
@@ -190,7 +189,7 @@ proc processBody(node, retFutureSym: NimNode,
   else: discard
 
   for i in 0 ..< result.len:
-    result[i] = processBody(result[i], retFutureSym, subTypeIsVoid,
+    result[i] = processBody(result[i], retFutureSym, retFutureType, subTypeIsVoid,
                             futureVarIdents)
 
 proc getName(node: NimNode): string {.compileTime.} =
@@ -213,7 +212,7 @@ proc getFutureVarIdents(params: NimNode): seq[NimNode] {.compileTime.} =
       result.add(params[i][0])
 
 proc isInvalidReturnType(typeName: string): bool =
-  return typeName notin ["Future"] #, "FutureStream"]
+  return typeName notin ["Future", "DisposableFuture"] #, "FutureStream"]
 
 proc verifyReturnType(typeName: string) {.compileTime.} =
   if typeName.isInvalidReturnType:
@@ -270,7 +269,7 @@ proc asyncSingleProc(prc: NimNode): NimNode {.compileTime.} =
     newVarStmt(retFutureSym,
       newCall(
         newNimNode(nnkBracketExpr, prc.body).add(
-          newIdentNode("newFuture"),
+          newIdentNode("newDisposableFuture"),
           subRetType),
       newLit(prcName)))) # Get type from return type of this proc
 
@@ -281,7 +280,7 @@ proc asyncSingleProc(prc: NimNode): NimNode {.compileTime.} =
   # ->   <proc_body>
   # ->   complete(retFuture, result)
   var iteratorNameSym = genSym(nskIterator, $prcName & "Iter")
-  var procBody = prc.body.processBody(retFutureSym, subtypeIsVoid,
+  var procBody = prc.body.processBody(retFutureSym, subRetType, subtypeIsVoid,
                                     futureVarIdents)
   # don't do anything with forward bodies (empty)
   if procBody.kind != nnkEmpty:
@@ -316,16 +315,24 @@ proc asyncSingleProc(prc: NimNode): NimNode {.compileTime.} =
         "gcsafe") != nil:
       closureIterator.addPragma(newIdentNode("gcsafe"))
     outerProcBody.add(closureIterator)
+    # create a Var to reference the iterator, for Dispose backref
+    var iteratorVar = genSym(nskVar, $prcName & "IterVar")
+    outerProcBody.add(newVarStmt(iteratorVar, iteratorNameSym))
+    #outerProcBody.add(newCall("addClosureIter", retFutureSym, iteratorVar))
 
-    # -> createCb(retFuture)
+    # -> createCb(retFuture) {.closure.}
     # NOTE: The NimAsyncContinueSuffix is checked for in asyncfutures.nim to produce
     # friendlier stack traces:
     var cbName = genSym(nskProc, prcName & NimAsyncContinueSuffix)
-    var procCb = getAst createCb(retFutureSym, iteratorNameSym,
+    var procCb = getAst createCb(retFutureSym, iteratorVar,
                          newStrLitNode(prcName),
                          cbName,
                          createFutureVarCompletions(futureVarIdents, nil))
     outerProcBody.add procCb
+    # create a Var to reference the closure, for Dispose backref
+    var cbVar = genSym(nskVar, $prcName & "ClosureVar")
+    outerProcBody.add(newVarStmt(cbVar, cbName))
+    outerProcBody.add(newCall("addClosure", retFutureSym, cbVar))
 
     # -> return retFuture
     outerProcBody.add newNimNode(nnkReturnStmt, prc.body[^1]).add(retFutureSym)
@@ -336,12 +343,16 @@ proc asyncSingleProc(prc: NimNode): NimNode {.compileTime.} =
     # Add discardable pragma.
     if returnType.kind == nnkEmpty:
       # Add Future[void]
-      result.params[0] = parseExpr("owned(Future[void])")
+      result.params[0] = parseExpr("owned(DisposableFuture[void])")
+  else:
+    result.params[0] = newCall("owned",
+      newTree(nnkBracketExpr, ident("DisposableFuture"), baseType)
+    )
   if procBody.kind != nnkEmpty:
     result.body = outerProcBody
-  #echo(treeRepr(result))
   #if prcName == "recvLineInto":
-  #  echo(toStrLit(result))
+    #echo(toStrLit(result))
+  #echo(toStrLit(result))
 
 macro async*(prc: untyped): untyped =
   ## Macro which processes async procedures into the appropriate
