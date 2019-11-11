@@ -30,7 +30,11 @@ when hasThreadSupport:
 
 when defined(nimTracing) or defined(leakDetector) or defined(nimGcRefLeak):
   import io
+  template trace(fmt: cstring) =
+      c_fprintf(cast[CFilePtr](stdout), fmt)
 
+  template traceArgs(fmt: cstring, args: varargs[untyped]) =
+      c_fprintf(cast[CFilePtr](stdout), fmt, args)
 type
   WalkOp = enum
     waMarkGlobal,  # we need to mark conservatively for global marker procs
@@ -193,12 +197,12 @@ proc nimGCunref(p: pointer) {.compilerproc.} =
 when defined(nimGcRefLeak):
   proc writeLeaks() =
     for i in 0..gch.additionalRoots.len-1:
-      c_fprintf(cast[CFilePtr](stdout), "[Heap] NEW STACK TRACE\n")
+      trace("[Heap] NEW STACK TRACE\n")
       for ii in 0..MaxTraceLen-1:
         let line = ax[i].lines[ii]
         let file = ax[i].files[ii]
         if isNil(line): break
-        c_fprintf(cast[CFilePtr](stdout), "[Heap] %s(%s)\n", file, line)
+        traceArgs("[Heap] %s(%s)\n", file, line)
 
 include gc_common
 
@@ -249,10 +253,11 @@ proc forAllChildren(cell: PCell, op: WalkOp) =
   gcAssert(isAllocatedPtr(gch.region, cell), "gah, not allocated anymore! C")
   gcAssert(cell.typ != nil, "forAllChildren: 2")
   gcAssert cell.typ.kind in {tyRef, tySequence, tyString}, "forAllChildren: 3"
-  when leakDetector:
-    c_fprintf(cast[CFilePtr](stdout), "  cell: %s (%s)\n", cell.typ.name, $cell.typ.kind)
+  #when leakDetector:
+    #traceArgs("  cell: %s (%s)\n", cell.typ.name, $cell.typ.kind)
   let marker = cell.typ.marker
   if marker != nil:
+    #traceArgs "marking: %s at %p\n", cell.typ.name, marker
     marker(cellToUsr(cell), op.int)
   else:
     case cell.typ.kind
@@ -278,10 +283,11 @@ proc rawNewObj(typ: PNimType, size: int, gch: var GcHeap): pointer =
   # now it is buffered in the ZCT
   res.typ = typ
   when leakDetector and not hasThreadSupport:
-    if framePtr != nil and framePtr.prev != nil:
-      res.filename = framePtr.prev.prev.filename
-      res.line = framePtr.prev.prev.line
-      c_fprintf(cast[CFilePtr](stdout), "%s allocated from : %s:%i\n", res.typ.name, res.filename, res.line)
+    var curFrame = framePtr
+    if curFrame != nil:
+      res.filename = curFrame.filename
+      res.line = curFrame.line
+
   res.refcount = 0
   when withBitvectors: incl(gch.allocated, res)
   when useCellIds:
@@ -373,8 +379,8 @@ proc mark(gch: var GcHeap, c: PCell) =
     # XXX no 'if c.refCount != rcBlack' here?
     when defined(nimTracing):
       if gch.tracing:
-        for i in 1..gch.indentation: c_fprintf(cast[CFilePtr](stdout), " ")
-        c_fprintf(cast[CFilePtr](stdout), "start marking %p of type %s ((\n",
+        for i in 1..gch.indentation: trace(" ")
+        traceArgs("start marking %p of type %s ((\n",
                   c, c.typ.name)
         inc gch.indentation, 2
 
@@ -391,12 +397,13 @@ proc mark(gch: var GcHeap, c: PCell) =
     when defined(nimTracing):
       if gch.tracing:
         dec gch.indentation, 2
-        for i in 1..gch.indentation: c_fprintf(cast[CFilePtr](stdout), " ")
-        c_fprintf(cast[CFilePtr](stdout), "finished marking %p of type %s))\n",
+        for i in 1..gch.indentation: trace(" ")
+        traceArgs("finished marking %p of type %s))\n",
                   c, c.typ.name)
 
 proc doOperation(p: pointer, op: WalkOp) =
-  if p == nil: return
+  if p == nil:
+    return
   var c: PCell = usrToCell(p)
   gcAssert(c != nil, "doOperation: 1")
   case op
@@ -405,9 +412,13 @@ proc doOperation(p: pointer, op: WalkOp) =
     when defined(nimTracing):
       if c.refcount == rcWhite: mark(gch, c)
     else:
+      #traceArgs "  doOperation - type: %s, refCount: %i\n", c.typ.name, c.refcount
       if c.refcount == rcWhite:
+        #trace "    refcount is white\n"
         c.refcount = rcBlack
         add(gch.tempStack, c)
+      #else:
+        #trace "    refcount is black\n"
 
 proc nimGCvisit(d: pointer, op: int) {.compilerRtl.} =
   doOperation(d, WalkOp(op))
@@ -416,7 +427,6 @@ proc freeCyclicCell(gch: var GcHeap, c: PCell) =
   gcAssert(isAllocatedPtr(gch.region, c), "freeCyclicCell() on an invalid cell!")
   inc gch.stat.freedObjects
   prepareDealloc(c)
-  #c_fprintf(cast[CFilePtr](stdout), "freeing: %s from %s:%i\n", c.typ.name, c.filename, c.line)
   when reallyDealloc: rawDealloc(gch.region, c)
   else:
     gcAssert(c.typ != nil, "freeCyclicCell")
@@ -430,6 +440,18 @@ proc dispose*[T](x: var ref T) {.inline.} =
   if p != nil:
     freeCyclicCell(gch, usrToCell(p))
     x = nil
+
+proc dispose*[T: string|seq](x: var T) {.inline.} =
+  ## Manual freeing of the object ``x``. This is an unsafe operation but
+  ## if used wisely, can speedup your program and avoid the pauses introduced
+  ## by the tracing GC.
+  let p = cast[pointer](x)
+  if p != nil:
+    freeCyclicCell(gch, usrToCell(p))
+  when T is string:
+    x = ""
+  when T is seq:
+    x = @[]
 
 proc dispose*[T: proc](x: var T) {.inline.} =
   ## Manual freeing of the object ``x``.
@@ -474,8 +496,6 @@ proc deepDispose*[T](x: var ref T) {.inline.} =
   let p = cast[pointer](x)
   if p != nil:
     let c = usrToCell(p)
-    when leakDetector:
-      c_fprintf(cast[CFilePtr](stdout), "deepDispose: %s\n", c.typ.name)
     deepDisposeImpl(gch, c)
     x = nil
 
@@ -487,8 +507,6 @@ proc deepDispose*[T: proc](x: var T) {.inline.} =
     let p = cast[pointer](rawEnv(x))
     if p != nil:
       let c = usrToCell(p)
-      when leakDetector:
-        c_fprintf(cast[CFilePtr](stdout), "deepDispose (proc): %s\n", c.typ.name)
       deepDisposeImpl(gch, c)
       # 'rawEnv(x) = nil' does not compile, hence the '.emit':
       {.emit: """
@@ -521,15 +539,15 @@ proc markGlobals(gch: var GcHeap) =
   if gch.gcThreadId == 0:
     when defined(nimTracing):
       if gch.tracing:
-        c_fprintf(cast[CFilePtr](stdout), "------- globals marking phase:\n")
+        trace("------- globals marking phase:\n")
     for i in 0 .. globalMarkersLen-1: globalMarkers[i]()
   when defined(nimTracing):
     if gch.tracing:
-      c_fprintf(cast[CFilePtr](stdout), "------- thread locals marking phase:\n")
+      trace("------- thread locals marking phase:\n")
   for i in 0 .. threadLocalMarkersLen-1: threadLocalMarkers[i]()
   when defined(nimTracing):
     if gch.tracing:
-      c_fprintf(cast[CFilePtr](stdout), "------- additional roots marking phase:\n")
+      trace("------- additional roots marking phase:\n")
   let d = gch.additionalRoots.d
   for i in 0 .. gch.additionalRoots.len-1: mark(gch, d[i])
 
@@ -551,7 +569,7 @@ proc collectCTBody(gch: var GcHeap) =
     gch.stat.maxStackSize = max(gch.stat.maxStackSize, stackSize())
   when defined(nimTracing):
     if gch.tracing:
-      c_fprintf(cast[CFilePtr](stdout), "------- stack marking phase:\n")
+      trace("------- stack marking phase:\n")
   prepareForInteriorPointerChecking(gch.region)
   markStackAndRegisters(gch)
   markGlobals(gch)
