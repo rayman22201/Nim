@@ -26,7 +26,7 @@ template createCb(retFutureSym, iteratorNameSym,
                   strName, identName, futureVarCompletions: untyped) =
   bind finished
 
-  var nameIterVar {.cursor.} = iteratorNameSym
+  var nameIterVar = iteratorNameSym
   proc identName {.closure.} =
     try:
       if not nameIterVar.finished:
@@ -330,7 +330,7 @@ proc asyncSingleProc(prc: NimNode): NimNode {.compileTime.} =
       result.params[0] = parseExpr("owned(Future[void])")
   if procBody.kind != nnkEmpty:
     result.body = outerProcBody
-  echo(treeRepr(result))
+  #echo(treeRepr(result))
   #if prcName == "recvLineInto":
   #  echo(toStrLit(result))
 
