@@ -33,6 +33,25 @@ type
 
   FutureVar*[T] = distinct Future[T]
 
+  # Theory:
+  # Futures have some properties that are useful for manual memory management.
+  # Namely, after the "lastReadOf(future<x>)", it is guaranteed safe to free any
+  # memory associated with future<x>.
+  # This includes any closure environments the reference future<x>.
+  # In fact, any closure environments that reference future<x> **must** be freed along with
+  # future<x> in order to prevent dangling pointers / GC collection errors (these are equivalent.)
+  # Questions:
+  # - should this be a subclass or a variant type?
+  # - is a proc(){.closure.} equivalent to a ref proc(){.closure.} (good enough at least?)
+  # - The async macro produces 1 closure + 1 closure iterator. But for the general case,
+  #   do we need a seq[proc(){.closure.}]? 
+  #   For example, recvFromInto, and sendTo from asyncdispatch.nim, generate Futures
+  #   "manually", outside of the async macro. They have a single closure (for the socket),
+  #   and no closure iterator....
+  DisposableFuture*[T] = ref object of Future[T]
+    closureRef*: owned(proc(){.closure.})
+    #closureIterRef: iterator(): FutureBase {.closure.}
+
   FutureError* = object of Exception
     cause*: FutureBase
 
@@ -130,10 +149,28 @@ proc newFutureVar*[T](fromProc = "unspecified"): owned(FutureVar[T]) =
   result = typeof(result)(fo)
   when isFutureLoggingEnabled: logFutureStart(Future[T](result))
 
+proc newDisposableFuture*[T](fromProc: string = "unspecified"): owned(DisposableFuture[T]) =
+  ## Creates a new future.
+  ##
+  ## Specifying ``fromProc``, which is a string specifying the name of the proc
+  ## that this future belongs to, is a good habit as it helps with debugging.
+  setupFutureBase(fromProc)
+  when isFutureLoggingEnabled: logFutureStart(result)
+
 proc clean*[T](future: FutureVar[T]) =
   ## Resets the ``finished`` status of ``future``.
   Future[T](future).finished = false
   Future[T](future).error = nil
+
+proc addClosure*[T; C: proc](future: DisposableFuture[T], closure: var C) =
+  when not (C is "closure") and not (C is iterator):
+    {.error "must supply a closure".}
+  future.closureRef = closure
+
+#proc addClosureIter*[T; C: iterator](future: DisposableFuture[T], closure: var C) =
+  #when not (C is "closure") and not (C is iterator):
+    #{.error "must supply a closure".}
+  #future.closureIterRef = closure
 
 proc checkFinished[T](future: Future[T]) =
   ## Checks whether `future` is finished. If it is then raises a
@@ -149,7 +186,7 @@ proc checkFinished[T](future: Future[T]) =
       msg.add("\n" & indent(($future.stackTrace).strip(), 4))
       when T is string:
         msg.add("\n  Contents (string): ")
-        msg.add("\n" & indent($future.value, 4))
+        msg.add("\n" & indent(future.value.repr, 4))
       msg.add("\n  Stack trace to moment of secondary completion:")
       msg.add("\n" & indent(getStackTrace().strip(), 4))
       var err = newException(FutureError, msg)
@@ -380,7 +417,7 @@ proc read*[T](future: Future[T] | FutureVar[T]): T =
   if fut.finished:
     if fut.error != nil:
       injectStacktrace(fut)
-      raise fut.error
+      raise move(fut.error)
     when T isnot void:
       return fut.value
   else:
